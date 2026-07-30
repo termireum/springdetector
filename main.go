@@ -30,6 +30,8 @@ type Finding struct {
 	Endpoint   string
 	StatusCode int
 	Size       int
+	Score      int
+	Reasons    []string
 }
 
 type Config struct {
@@ -43,6 +45,7 @@ type Config struct {
 	Headers       map[string]string
 	Verbose       bool
 	FilterCodes   []int
+	MinScore      int
 }
 
 func banner() {
@@ -124,32 +127,126 @@ func runSubfinder(domain string) ([]string, error) {
 	return subdomains, nil
 }
 
-func isSpringBoot(body string, headers http.Header) bool {
-	indicators := []string{
-		`"status":"UP"`,
-		`"status": "UP"`,
-		`"status":"DOWN"`,
-		`"diskSpace"`,
-		`"components"`,
-		`"_links"`,
-		`"actuator"`,
-		`"configprops"`,
-		`"spring"`,
-		`"Spring Boot"`,
-		`Whitelabel Error Page`,
-		`There was an unexpected error`,
-		`application/vnd.spring-boot.actuator`,
-	}
-	for _, ind := range indicators {
-		if strings.Contains(body, ind) {
-			return true
-		}
+type ScoreResult struct {
+	Score   int
+	Reasons []string
+}
+
+func scoreResponse(body string, headers http.Header, endpoint string, statusCode int) ScoreResult {
+	var result ScoreResult
+
+	// Skor 5 — paling kuat, header resmi Spring Boot
+	officialHeaders := map[string]string{
+		"application/vnd.spring-boot.actuator.v1+json": "official Spring Boot actuator v1 Content-Type",
+		"application/vnd.spring-boot.actuator.v2+json": "official Spring Boot actuator v2 Content-Type",
+		"application/vnd.spring-boot.actuator.v3+json": "official Spring Boot actuator v3 Content-Type",
 	}
 	ct := headers.Get("Content-Type")
-	if strings.Contains(ct, "application/vnd.spring-boot.actuator") {
-		return true
+	for pattern, reason := range officialHeaders {
+		if strings.Contains(ct, pattern) {
+			result.Score += 5
+			result.Reasons = append(result.Reasons, reason)
+		}
 	}
-	return false
+
+	// Skor 3 — indikator kuat dari body
+	strongIndicators := map[string]string{
+		`"_links"`:            "actuator _links structure",
+		`"propertySources"`:   "propertySources (/env signature)",
+		`"classLoader"`:       "classLoader (/beans signature)",
+		`"threadName"`:        "threadName (/threaddump signature)",
+		`"configuredLevel"`:   "configuredLevel (/loggers signature)",
+		`"measurements"`:      "measurements (/metrics signature)",
+		`"diskSpace"`:         "diskSpace component (/health)",
+		`"configprops"`:       "configprops field detected",
+		`"requestMappings"`:   "requestMappings (/mappings signature)",
+		`"reportedApplications"`: "reportedApplications (/httptrace)",
+		`"traces"`:            "traces field (/httptrace signature)",
+		`"value"`:             "Jolokia value response",
+		`Whitelabel Error Page`: "Spring Whitelabel error page",
+		`"timestamp"`:         "Spring error timestamp field",
+		`"path"`:              "Spring error path field",
+		`"error"`:             "Spring error field",
+	}
+	// Kombinasi timestamp+path+error = Spring error response (skor akumulatif)
+	springErrorFields := 0
+	for pattern, reason := range strongIndicators {
+		if strings.Contains(body, pattern) {
+			// Khusus error fields, akumulasi dulu
+			if pattern == `"timestamp"` || pattern == `"path"` || pattern == `"error"` {
+				springErrorFields++
+				// Baru tambah skor kalau minimal 2 dari 3 field ada
+				if springErrorFields == 2 {
+					result.Score += 3
+					result.Reasons = append(result.Reasons, "Spring error response (timestamp+path+error)")
+				}
+				continue
+			}
+			result.Score += 3
+			result.Reasons = append(result.Reasons, reason)
+		}
+	}
+
+	// Skor 2 — indikator medium
+	mediumIndicators := map[string]string{
+		`"status":"UP"`:    "health status UP",
+		`"status": "UP"`:  "health status UP",
+		`"status":"DOWN"`: "health status DOWN",
+		`"status":"OUT_OF_SERVICE"`: "health OUT_OF_SERVICE",
+		`"components"`:    "health components structure",
+		`"details"`:       "health details field",
+		`"started"`:       "Spring started event",
+		`"uptime"`:        "application uptime",
+		`"build"`:         "build info field",
+		`"git"`:           "git info field",
+	}
+	for pattern, reason := range mediumIndicators {
+		if strings.Contains(body, pattern) {
+			result.Score += 2
+			result.Reasons = append(result.Reasons, reason)
+		}
+	}
+
+	// Skor 1 — indikator lemah (butuh kombinasi)
+	weakIndicators := map[string]string{
+		`"status"`:  "generic status field",
+		`"message"`: "generic message field",
+		`"info"`:    "generic info field",
+	}
+	for pattern, reason := range weakIndicators {
+		if strings.Contains(body, pattern) {
+			result.Score += 1
+			result.Reasons = append(result.Reasons, reason)
+		}
+	}
+
+	// Bonus: JSON response pada 200
+	if strings.Contains(ct, "application/json") && statusCode == 200 {
+		result.Score += 1
+		result.Reasons = append(result.Reasons, "JSON response on 200")
+	}
+
+	// Penalti: response terlalu pendek (kemungkinan redirect / halaman kosong)
+	if len(body) < 30 && result.Score > 0 {
+		result.Score -= 2
+		result.Reasons = append(result.Reasons, "[penalty] response body terlalu pendek")
+	}
+
+	// Penalti: ada indikasi bukan Spring (HTML biasa, login page generik)
+	falsePositiveIndicators := []string{
+		"<html", "<!DOCTYPE", "<title>Login</title>",
+		"nginx", "Apache", "IIS",
+		"jQuery", "bootstrap.min.js",
+	}
+	for _, fp := range falsePositiveIndicators {
+		if strings.Contains(strings.ToLower(body), strings.ToLower(fp)) {
+			result.Score -= 2
+			result.Reasons = append(result.Reasons, "[penalty] kemungkinan halaman non-Spring: "+fp)
+			break
+		}
+	}
+
+	return result
 }
 
 func shouldShow(code int, filterCodes []int) bool {
@@ -164,7 +261,7 @@ func shouldShow(code int, filterCodes []int) bool {
 	return false
 }
 
-func probeEndpoint(client *http.Client, baseURL, endpoint string, extraHeaders map[string]string) *Finding {
+func probeEndpoint(client *http.Client, baseURL, endpoint string, extraHeaders map[string]string, minScore int) *Finding {
 	url := baseURL + endpoint
 
 	req, err := http.NewRequest("GET", url, nil)
@@ -173,7 +270,7 @@ func probeEndpoint(client *http.Client, baseURL, endpoint string, extraHeaders m
 	}
 
 	req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; SpringDetector/1.0)")
-	req.Header.Set("Accept", "*/*")
+	req.Header.Set("Accept", "application/json, */*")
 	for k, v := range extraHeaders {
 		req.Header.Set(k, v)
 	}
@@ -188,32 +285,32 @@ func probeEndpoint(client *http.Client, baseURL, endpoint string, extraHeaders m
 		return nil
 	}
 
-	buf := make([]byte, 4096)
+	// Baca lebih banyak body untuk scoring yang akurat
+	buf := make([]byte, 8192)
 	n, _ := resp.Body.Read(buf)
 	bodySnippet := string(buf[:n])
 	size := len(bodySnippet)
 
-	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-		if isSpringBoot(bodySnippet, resp.Header) || isInterestingEndpoint(endpoint) {
-			return &Finding{
-				Endpoint:   endpoint,
-				StatusCode: resp.StatusCode,
-				Size:       size,
-			}
-		}
+	// Scoring
+	scored := scoreResponse(bodySnippet, resp.Header, endpoint, resp.StatusCode)
+
+	// Untuk 401/403 pada endpoint Spring yang dikenal, beri bonus skor
+	if (resp.StatusCode == 401 || resp.StatusCode == 403) && isInterestingEndpoint(endpoint) {
+		scored.Score += 2
+		scored.Reasons = append(scored.Reasons, fmt.Sprintf("auth-protected Spring endpoint (%d)", resp.StatusCode))
 	}
 
-	if resp.StatusCode == 401 || resp.StatusCode == 403 {
-		if isInterestingEndpoint(endpoint) {
-			return &Finding{
-				Endpoint:   endpoint,
-				StatusCode: resp.StatusCode,
-				Size:       size,
-			}
-		}
+	if scored.Score < minScore {
+		return nil
 	}
 
-	return nil
+	return &Finding{
+		Endpoint:   endpoint,
+		StatusCode: resp.StatusCode,
+		Size:       size,
+		Score:      scored.Score,
+		Reasons:    scored.Reasons,
+	}
 }
 
 func isInterestingEndpoint(endpoint string) bool {
@@ -260,7 +357,7 @@ func scanSubdomain(cfg *Config, client *http.Client, subdomain string, endpoints
 			go func() {
 				defer innerWg.Done()
 				for ep := range jobCh {
-					result := probeEndpoint(client, baseURL, ep, cfg.Headers)
+					result := probeEndpoint(client, baseURL, ep, cfg.Headers, cfg.MinScore)
 					if result != nil && shouldShow(result.StatusCode, cfg.FilterCodes) {
 						result.Subdomain = baseURL
 						findings <- *result
@@ -275,6 +372,26 @@ func scanSubdomain(cfg *Config, client *http.Client, subdomain string, endpoints
 		close(jobCh)
 		innerWg.Wait()
 	}
+}
+
+func scoreBar(score int) string {
+	maxScore := 10
+	if score > maxScore {
+		score = maxScore
+	}
+	filled := score
+	empty := maxScore - filled
+	bar := strings.Repeat("█", filled) + strings.Repeat("░", empty)
+	var color string
+	switch {
+	case score >= 7:
+		color = colorGreen
+	case score >= 4:
+		color = colorYellow
+	default:
+		color = colorRed
+	}
+	return fmt.Sprintf("%s%s%s %d/10", color, bar, colorReset, score)
 }
 
 func statusColor(code int) string {
@@ -306,6 +423,7 @@ func main() {
 	flag.StringVar(&headerStr, "H", "", "Extra headers (format: 'Key:Value,Key2:Value2')")
 	flag.BoolVar(&cfg.Verbose, "v", false, "Verbose output")
 	flag.StringVar(&filterStr, "fc", "", "Filter by status code (e.g. 200 or 200,403)")
+	flag.IntVar(&cfg.MinScore, "ms", 3, "Minimum confidence score to report (1-10, default: 3)")
 	flag.Parse()
 
 	if cfg.Target == "" {
@@ -330,12 +448,14 @@ func main() {
 		fmt.Printf("%s[*]%s Filter aktif: hanya menampilkan status code %s\n", colorCyan, colorReset, filterStr)
 	}
 
+	fmt.Printf("%s[*]%s Minimum confidence score: %d/10\n", colorCyan, colorReset, cfg.MinScore)
+
 	// Parse schemes
 	for _, s := range strings.Split(schemeStr, ",") {
 		cfg.Schemes = append(cfg.Schemes, strings.TrimSpace(s))
 	}
 
-	// Parse extra headers
+	// Default bypass headers
 	cfg.Headers = map[string]string{
 		"X-Forwarded-For":  "127.0.0.1",
 		"X-Forwarded-Host": "localhost",
@@ -403,10 +523,19 @@ func main() {
 			sc := statusColor(f.StatusCode)
 			fmt.Printf("\n%s[FOUND]%s %s%s%s\n",
 				colorGreen+colorBold, colorReset,
-				colorCyan, f.Subdomain, colorReset)
-			fmt.Printf("        %sEndpoint:%s %s\n", colorBold, colorReset, f.Endpoint)
-			fmt.Printf("        %sStatus:%s  %s%d%s | Size: %d bytes\n",
+				colorCyan+colorBold, f.Subdomain, colorReset)
+			fmt.Printf("        %sEndpoint :%s %s\n", colorBold, colorReset, f.Endpoint)
+			fmt.Printf("        %sStatus   :%s %s%d%s | Size: %d bytes\n",
 				colorBold, colorReset, sc, f.StatusCode, colorReset, f.Size)
+			fmt.Printf("        %sScore    :%s %s\n", colorBold, colorReset, scoreBar(f.Score))
+			// Tampilkan reasons, filter penalty agar tidak berisik
+			var cleanReasons []string
+			for _, r := range f.Reasons {
+				if !strings.HasPrefix(r, "[penalty]") {
+					cleanReasons = append(cleanReasons, r)
+				}
+			}
+			fmt.Printf("        %sEvidence :%s %s\n", colorBold, colorReset, strings.Join(cleanReasons, ", "))
 		}
 	}()
 
@@ -434,8 +563,9 @@ func main() {
 	fmt.Printf(" Target       : %s\n", cfg.Target)
 	fmt.Printf(" Subdomains   : %d\n", len(subdomains))
 	fmt.Printf(" Endpoints    : %d\n", len(endpoints))
+	fmt.Printf(" Min Score    : %d/10\n", cfg.MinScore)
 	if len(cfg.FilterCodes) > 0 {
-		fmt.Printf(" Filter       : %s%v%s\n", colorCyan, cfg.FilterCodes, colorReset)
+		fmt.Printf(" Filter       : %v\n", cfg.FilterCodes)
 	}
 	fmt.Printf(" Findings     : %s%d%s\n", colorGreen+colorBold, len(allFindings), colorReset)
 	fmt.Println()
@@ -454,7 +584,8 @@ func main() {
 			fmt.Printf("  %s%s%s\n", colorCyan+colorBold, host, colorReset)
 			for _, f := range flist {
 				sc := statusColor(f.StatusCode)
-				fmt.Printf("    %s%-3d%s  %s\n", sc, f.StatusCode, colorReset, f.Endpoint)
+				fmt.Printf("    %s%-3d%s  %-50s  score:%d/10\n",
+					sc, f.StatusCode, colorReset, f.Endpoint, f.Score)
 			}
 			fmt.Println()
 		}
@@ -485,7 +616,15 @@ func saveFindings(path string, findings []Finding) {
 	for host, flist := range grouped {
 		f.WriteString(fmt.Sprintf("[%s]\n", host))
 		for _, fi := range flist {
-			f.WriteString(fmt.Sprintf("  [%d] %s (size: %d)\n", fi.StatusCode, fi.Endpoint, fi.Size))
+			var cleanReasons []string
+			for _, r := range fi.Reasons {
+				if !strings.HasPrefix(r, "[penalty]") {
+					cleanReasons = append(cleanReasons, r)
+				}
+			}
+			f.WriteString(fmt.Sprintf("  [%d] %s (score:%d/10, size:%d)\n",
+				fi.StatusCode, fi.Endpoint, fi.Score, fi.Size))
+			f.WriteString(fmt.Sprintf("       evidence: %s\n", strings.Join(cleanReasons, ", ")))
 		}
 		f.WriteString("\n")
 	}
