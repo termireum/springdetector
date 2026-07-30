@@ -2,7 +2,7 @@
 
 > Spring Boot Actuator & Endpoint Detector for Bug Bounty & Penetration Testing
 
-SpringDetector adalah tool reconnaissance berbasis Go untuk mendeteksi endpoint Spring Boot yang terekspos pada sebuah domain dan seluruh subdomainnya secara otomatis.
+SpringDetector adalah tool reconnaissance berbasis Go untuk mendeteksi endpoint Spring Boot yang terekspos pada sebuah domain dan seluruh subdomainnya secara otomatis. Dilengkapi sistem **confidence scoring** untuk meminimalkan false positive.
 
 ---
 
@@ -10,8 +10,10 @@ SpringDetector adalah tool reconnaissance berbasis Go untuk mendeteksi endpoint 
 
 - **Auto subdomain enumeration** via `subfinder`
 - **1000+ endpoint wordlist** mencakup actuator, semicolon bypass, path traversal, dll
-- **Spring Boot fingerprinting** dari response body & headers
+- **Confidence scoring system** — validasi response sebelum dilaporkan, bukan sekadar status code
+- **Anti false-positive** — penalti otomatis untuk halaman HTML, nginx, jQuery, dll
 - **Filter status code** dengan flag `-fc`
+- **Minimum score threshold** dengan flag `-ms`
 - **Concurrent scanning** — 5 subdomain paralel, masing-masing multi-thread
 - **Bypass headers otomatis** — `X-Forwarded-For`, `X-Forwarded-Host`
 - **Output ke file** untuk dokumentasi laporan
@@ -60,6 +62,7 @@ sudo mv springdetector /usr/local/bin/
 | `-u` | — | Target domain (wajib) |
 | `-w` | — | Path ke wordlist (wajib) |
 | `-fc` | — | Filter status code, misal `200` atau `200,403` |
+| `-ms` | `3` | Minimum confidence score (1–10) |
 | `-t` | `20` | Jumlah thread per subdomain |
 | `-timeout` | `10` | HTTP timeout dalam detik |
 | `-o` | — | Simpan hasil ke file |
@@ -87,6 +90,16 @@ sudo mv springdetector /usr/local/bin/
 ./springdetector -u example.com -w springboot_extended.txt -fc 200,403
 ```
 
+**Mode strict — hanya yang sangat confident (skor ≥ 6):**
+```bash
+./springdetector -u example.com -w springboot_extended.txt -ms 6
+```
+
+**Mode longgar — tangkap semua kemungkinan (skor ≥ 1):**
+```bash
+./springdetector -u example.com -w springboot_extended.txt -ms 1
+```
+
 **Skip subfinder, scan satu subdomain langsung:**
 ```bash
 ./springdetector -u admin.example.com -w springboot_extended.txt --no-subfinder
@@ -109,7 +122,7 @@ sudo mv springdetector /usr/local/bin/
 
 **Kombinasi lengkap:**
 ```bash
-./springdetector -u example.com -w springboot_extended.txt -fc 200 -t 30 -o hasil.txt
+./springdetector -u example.com -w springboot_extended.txt -fc 200 -ms 5 -t 30 -o hasil.txt
 ```
 
 ---
@@ -121,16 +134,22 @@ sudo mv springdetector /usr/local/bin/
 [~] Scanning https://api.example.com (874 endpoints)
 
 [FOUND] https://admin.example.com
-        Endpoint: /actuator/env
-        Status:   200 | Size: 4821 bytes
+        Endpoint : /actuator/env
+        Status   : 200 | Size: 4821 bytes
+        Score    : ████████░░ 8/10
+        Evidence : propertySources (/env signature), JSON response on 200, official Spring Boot actuator v2 Content-Type
 
 [FOUND] https://admin.example.com
-        Endpoint: /actuator/beans
-        Status:   200 | Size: 18432 bytes
+        Endpoint : /actuator/beans
+        Status   : 200 | Size: 18432 bytes
+        Score    : ██████░░░░ 6/10
+        Evidence : classLoader (/beans signature), actuator _links structure, JSON response on 200
 
 [FOUND] https://api.example.com
-        Endpoint: /actuator
-        Status:   403 | Size: 112 bytes
+        Endpoint : /actuator
+        Status   : 403 | Size: 112 bytes
+        Score    : ████░░░░░░ 4/10
+        Evidence : auth-protected Spring endpoint (403)
 
 ═══════════════════════════════════════════════════════
  SCAN COMPLETE
@@ -138,18 +157,43 @@ sudo mv springdetector /usr/local/bin/
  Target       : example.com
  Subdomains   : 47
  Endpoints    : 874
+ Min Score    : 3/10
  Filter       : [200]
  Findings     : 3
 
 [+] Exposed Spring Boot Endpoints:
 
   https://admin.example.com
-    200  /actuator/env
-    200  /actuator/beans
+    200  /actuator/env                                       score:8/10
+    200  /actuator/beans                                     score:6/10
 
   https://api.example.com
-    403  /actuator
+    403  /actuator                                           score:4/10
 ```
+
+---
+
+## 🎯 Confidence Scoring System
+
+Setiap response dianalisis sebelum dikategorikan sebagai finding. Skor dihitung dari akumulasi indikator berikut:
+
+| Skor | Indikator |
+|------|-----------|
+| **+5** | Header `application/vnd.spring-boot.actuator.*` (paling kuat) |
+| **+3** | `propertySources`, `classLoader`, `threadName`, `_links`, `requestMappings`, `Whitelabel Error Page`, Spring error response, dll |
+| **+2** | `status: UP/DOWN`, `components`, `uptime`, `build`, `git`, bonus 401/403 pada endpoint Spring |
+| **+1** | Field generik (`status`, `message`), JSON response on 200 |
+| **−2** | Penalti: body terlalu pendek |
+| **−2** | Penalti: ada indikasi non-Spring (`<html>`, `nginx`, `jQuery`, `Apache`, dll) |
+
+**Panduan threshold `-ms`:**
+
+| Nilai | Karakter | Cocok untuk |
+|-------|----------|-------------|
+| `1–2` | Longgar | Recon awal, tidak mau ada yang terlewat |
+| `3` | Balanced *(default)* | Penggunaan umum |
+| `5–6` | Ketat | Ingin hasil bersih, siap dilaporkan |
+| `7+` | Sangat ketat | Hanya yang punya bukti kuat |
 
 ---
 
@@ -185,18 +229,21 @@ springdetector -u example.com -w wordlist.txt
        ├─► untuk setiap subdomain:
        │     ├─► connectivity check (https dulu, lalu http)
        │     └─► probe semua endpoint dari wordlist (concurrent)
-       │           ├─► cek status code
-       │           ├─► fingerprint Spring Boot dari body & headers
+       │           ├─► baca response body (8KB)
+       │           ├─► hitung confidence score dari indikator
+       │           ├─► terapkan penalti untuk false positive
+       │           ├─► bandingkan dengan -ms threshold
        │           └─► filter status code jika -fc aktif
        │
-       └─► tampilkan findings + summary
+       └─► tampilkan findings + evidence + summary
 ```
 
-**Spring Boot terdeteksi jika:**
-- Response body mengandung signature seperti `"status":"UP"`, `"_links"`, `Whitelabel Error Page`
-- Header `Content-Type` mengandung `application/vnd.spring-boot.actuator`
-- Endpoint termasuk kata kunci Spring Boot (`actuator`, `env`, `heapdump`, dll)
-- Status 401/403 pada endpoint Spring Boot (auth-protected, tetap dilaporkan)
+**Spring Boot terdeteksi berdasarkan:**
+- Header resmi `application/vnd.spring-boot.actuator.*`
+- Signature body spesifik per endpoint (`propertySources` untuk `/env`, `classLoader` untuk `/beans`, dll)
+- Struktur JSON khas Spring Boot (`_links`, `components`, `diskSpace`)
+- Spring Whitelabel Error Page
+- Akumulasi indikator lemah yang cukup kuat secara kombinasi
 
 ---
 
